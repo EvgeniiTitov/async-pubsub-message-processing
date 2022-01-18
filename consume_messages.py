@@ -32,15 +32,15 @@ async def consume(pull_batch: int, num_pullers: int) -> None:
         subscriber = SubscriberClient(session=session)
         logger.info("Subscriber client initialized")
 
-        message_queue = asyncio.Queue(100)
-        ack_queue = asyncio.Queue(100)
-        nack_queue = asyncio.Queue(100)
+        message_queue: "asyncio.Queue[SubscriberMessage]" = asyncio.Queue(100)
+        ack_queue: "asyncio.Queue[SubscriberMessage]" = asyncio.Queue(100)
+        nack_queue: "asyncio.Queue[SubscriberMessage]" = asyncio.Queue(100)
 
-        puller_tasks = []
-        consumer_tasks = []
-        producer_tasks = []
-        ack_tasks = []
-        nack_tasks = []
+        puller_tasks: t.List[asyncio.Task] = []
+        consumer_tasks: t.List[asyncio.Task] = []
+        producer_tasks: t.List[asyncio.Task] = []
+        ack_tasks: t.List[asyncio.Task] = []
+        nack_tasks: t.List[asyncio.Task] = []
 
         for i in range(num_pullers):
             puller = Puller(
@@ -70,20 +70,6 @@ async def consume(pull_batch: int, num_pullers: int) -> None:
         done, _ = await asyncio.wait(
             all_tasks, return_when=asyncio.FIRST_COMPLETED
         )
-        # while True:
-        #     logger.info("Pulling messages from the backend")
-        #     messages: t.List[SubscriberMessage] = await subscriber.pull(
-        #         subscription=SUBSCRIPTION,
-        #         max_messages=pull_batch,
-        #         session=session,
-        #         timeout=30
-        #     )
-        #     if not len(messages):
-        #         logger.info("No messages in the queue, trying again")
-        #         continue
-        #     logger.info(f"Received batch of messages")
-        #     for message in messages:
-        #         asyncio.create_task(handle_message(message))
 
 
 async def perform_shutdown(

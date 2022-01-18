@@ -11,6 +11,4 @@ SignalHandlerCallable = t.Callable[
     [asyncio.AbstractEventLoop, t.Optional[signal.Signals]], t.Any
 ]
 
-MessageHandlerCallable = t.Callable[
-    [SubscriberMessage, t.Any], t.Awaitable[None]
-]
+MessageHandlerCallable = t.Callable[[SubscriberMessage], t.Awaitable[None]]
