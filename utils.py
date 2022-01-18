@@ -15,7 +15,7 @@ class Puller(LoggerMixin):
         subscription: str,
         *,
         batch_size: int = 5,
-        timeout: int = 15,
+        timeout: int = 30,
         name: t.Optional[str] = None,
     ) -> None:
         self._subscriber_client = subscriber_client
@@ -88,6 +88,7 @@ class Consumer(LoggerMixin):
         try:
             while True:
                 message = await message_queue.get()
+                self._logger.info("Consumer received message")
                 await asyncio.shield(self._consume_one_message(message))
                 message_queue.task_done()
         except asyncio.CancelledError:

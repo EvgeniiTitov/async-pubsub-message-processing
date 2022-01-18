@@ -7,7 +7,7 @@ from gcloud.aio.pubsub import SubscriberClient, SubscriberMessage
 import aiohttp
 
 from _types import SignalHandlerCallable
-from utils import Puller
+from utils import Puller, Consumer
 
 
 logger = logging.getLogger(__file__)
@@ -27,23 +27,49 @@ async def handle_message(message: SubscriberMessage) -> None:
     await asyncio.sleep(1)
 
 
-async def consume(pull_batch: int) -> None:
+async def consume(pull_batch: int, num_pullers: int) -> None:
     async with aiohttp.ClientSession() as session:
         subscriber = SubscriberClient(session=session)
         logger.info("Subscriber client initialized")
 
         message_queue = asyncio.Queue(100)
-        puller = Puller(subscriber, message_queue, SUBSCRIPTION, name="1")
-        puller_2 = Puller(subscriber, message_queue, SUBSCRIPTION, name="2")
-        pull_task = asyncio.create_task(
-            puller.pull_messages_and_populate_queue(put_async=False)
-        )
-        pull_task_2 = asyncio.create_task(
-            puller_2.pull_messages_and_populate_queue(put_async=False)
-        )
-        await pull_task
-        await pull_task_2
+        ack_queue = asyncio.Queue(100)
+        nack_queue = asyncio.Queue(100)
 
+        puller_tasks = []
+        consumer_tasks = []
+        producer_tasks = []
+        ack_tasks = []
+        nack_tasks = []
+
+        for i in range(num_pullers):
+            puller = Puller(
+                subscriber_client=subscriber,
+                message_queue=message_queue,
+                subscription=SUBSCRIPTION,
+                name=str(i),
+            )
+            puller_tasks.append(
+                asyncio.create_task(
+                    puller.pull_messages_and_populate_queue(put_async=False)
+                )
+            )
+        logger.info("Pullers started")
+
+        consumer = Consumer(
+            message_queue=message_queue,
+            ack_queue=ack_queue,
+            nack_queue=nack_queue,
+            handle_message_callback=handle_message,
+            max_concurrent_tasks=100,
+        )
+        consumer_tasks.append(asyncio.create_task(consumer.process_messages()))
+        logger.info("Consumer started")
+
+        all_tasks = [*puller_tasks, *consumer_tasks]
+        done, _ = await asyncio.wait(
+            all_tasks, return_when=asyncio.FIRST_COMPLETED
+        )
         # while True:
         #     logger.info("Pulling messages from the backend")
         #     messages: t.List[SubscriberMessage] = await subscriber.pull(
@@ -112,7 +138,7 @@ def main() -> int:
     loop = asyncio.get_event_loop()
     configure_event_loop(loop)
     try:
-        loop.create_task(consume(batch_size))
+        loop.create_task(consume(batch_size, num_pullers=2))
         loop.run_forever()
     finally:
         loop.close()
