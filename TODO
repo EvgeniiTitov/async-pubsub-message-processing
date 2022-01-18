@@ -1,0 +1,9 @@
+1. Get pubsub message with some text (say a comment)
+
+2. Run semantic analysis
+
+3. Publish results to a different pubsub topic
+
+
+TODO:
+1) kill -9 PID doesnt trigger the signal handler
