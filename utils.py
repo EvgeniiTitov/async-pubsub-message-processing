@@ -1,5 +1,7 @@
 import asyncio
 import typing as t
+from abc import ABC, abstractmethod
+import time
 
 from gcloud.aio.pubsub import SubscriberClient, SubscriberMessage
 
@@ -7,14 +9,43 @@ from _types import MessageHandlerCallable
 from logger import LoggerMixin
 
 
-class Puller(LoggerMixin):
+__all__ = ("Puller", "Consumer", "Acker", "Nacker", "Publisher")
+
+
+T = t.TypeVar("T")
+
+
+class BaseWorker(ABC):
+    @abstractmethod
+    async def run_loop(self, *args, **kwargs) -> None:
+        ...
+
+
+async def _accumulate_batch(
+    queue: asyncio.Queue[T], time_window: float
+) -> t.List[T]:
+    batch = []
+    while time_window > 0:
+        start = time.perf_counter()
+        try:
+            message = await asyncio.wait_for(queue.get(), timeout=time_window)
+        except asyncio.TimeoutError:
+            break
+        else:
+            batch.append(message)
+            time_window -= time.perf_counter() - start
+    return batch
+
+
+class Puller(LoggerMixin, BaseWorker):
     """
     Pulls messages from a PubSub topic and puts them in a queue connected to
     the Consumer
 
     # TODO: Add message validation (json schema - pydantic?)
     # TODO: Gracefully terminate the puller if the coro gets cancelled. You
-    #       might have pulled messages that haven't been processed yet
+            might have pulled messages that haven't been processed yet
+    # TODO: Do you really need self._must_stop? Its not a thread/process
     """
 
     def __init__(
@@ -41,7 +72,7 @@ class Puller(LoggerMixin):
     def is_running(self) -> bool:
         return self._running
 
-    async def pull_messages_and_populate_queue(self, put_async: bool) -> None:
+    async def run_loop(self, put_async: bool) -> None:
         self._running = True
         self._logger.info(f"Puller{self._name} started")
         try:
@@ -72,13 +103,14 @@ class Puller(LoggerMixin):
         self._must_stop = True
 
 
-class Consumer(LoggerMixin):
+class Consumer(LoggerMixin, BaseWorker):
     """
     Receives messages to process from the message queue populated by the
     Puller(s).
     Processes messages by calling the callback provided on each message. If the
     message's been successfully processed, its ID lands in the ack queue to get
     acked.
+    # TODO: Do you really need self._must_stop?
     """
 
     def __init__(
@@ -104,7 +136,7 @@ class Consumer(LoggerMixin):
     def is_running(self) -> bool:
         return self._running
 
-    async def process_messages(self) -> None:
+    async def run_loop(self) -> None:
         self._running = True
         self._logger.info("Consumer started")
         message_queue = self._message_queue
@@ -121,6 +153,10 @@ class Consumer(LoggerMixin):
             # Ensure all scheduled message processing jobs have completed
             for _ in range(self._max_concurrent_tasks):
                 await self._sema.acquire()
+            self._logger.info(
+                "Consumer waited for all messages to get processed. "
+                "Waiting for Acker and Nacker"
+            )
             # Ensure Acker acknowledged all successfully processed messages
             await self._ack_queue.join()
             # Ensure Nacker naked all unsuccessfully processed messages
@@ -139,10 +175,10 @@ class Consumer(LoggerMixin):
             await self._callback(message)
             await self._ack_queue.put(message.ack_id)
         except asyncio.CancelledError:
-            await self._nack_queue.put(message.ack_id)
+            # await self._nack_queue.put(message.ack_id)
             self._logger.info("Callback was cancelled")
         except Exception as e:
-            await self._nack_queue.put(message.ack_id)
+            # await self._nack_queue.put(message.ack_id)
             self._logger.info(f"Provided callback raised exception {e}")
 
 
@@ -150,8 +186,67 @@ class Publisher:
     pass
 
 
-class Acker:
-    pass
+class Acker(LoggerMixin, BaseWorker):
+    """
+    Acknowledges successfully processed messages by accumulating a batch of IDs
+    and then calling Google's API
+    # TODO: Do you really need self._must_stop?
+    # TODO: The logic is ugly, think again! Try re-acking if failed
+    """
+
+    def __init__(
+        self,
+        ack_queue: asyncio.Queue,
+        subscriber_client: SubscriberClient,
+        subscription: str,
+        *,
+        batch_accumulation_time_window: float = 0.3,
+        name: t.Optional[str] = None,
+    ) -> None:
+        self._ack_queue = ack_queue
+        self._subscriber_client = subscriber_client
+        self._subscription = subscription
+        self._time_window = batch_accumulation_time_window
+        self._name = name
+        self._running = False
+        self._must_stop = False
+        self._logger.info(f"Acker{self._name} initialized")
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    async def run_loop(self) -> None:
+        self._running = True
+        try:
+            while True:
+                ack_ids: t.List[str] = []
+                # Ensure there's at least one ID to acknowledge + get any
+                # extra IDs within time window
+                ack_ids.append(await self._ack_queue.get())
+                ack_ids += await _accumulate_batch(
+                    self._ack_queue, time_window=self._time_window
+                )
+                try:
+                    await self._subscriber_client.acknowledge(
+                        subscription=self._subscription, ack_ids=ack_ids
+                    )
+                except Exception as e:
+                    self._logger.error(
+                        f"Acknowledge request failed", exc_info=e
+                    )
+                    # TODO: Try acking each ID separately?
+                except asyncio.CancelledError:
+                    raise
+                else:
+                    for _ in ack_ids:
+                        self._ack_queue.task_done()
+                    self._logger.info(
+                        f"Acker{self._name} acknowledged a batch of IDs"
+                    )
+        except asyncio.CancelledError:
+            self._logger.info(f"Acker{self._name} worker cancelled")
+            raise
 
 
 class Nacker:

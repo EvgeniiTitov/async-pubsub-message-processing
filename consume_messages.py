@@ -7,7 +7,7 @@ from gcloud.aio.pubsub import SubscriberClient, SubscriberMessage
 import aiohttp
 
 from _types import SignalHandlerCallable
-from utils import Puller, Consumer
+from utils import Puller, Consumer, Acker
 
 
 logger = logging.getLogger(__file__)
@@ -50,9 +50,7 @@ async def consume(pull_batch: int, num_pullers: int) -> None:
                 name=str(i),
             )
             puller_tasks.append(
-                asyncio.create_task(
-                    puller.pull_messages_and_populate_queue(put_async=False)
-                )
+                asyncio.create_task(puller.run_loop(put_async=False))
             )
         logger.info("Pullers started")
 
@@ -63,8 +61,17 @@ async def consume(pull_batch: int, num_pullers: int) -> None:
             handle_message_callback=handle_message,
             max_concurrent_tasks=100,
         )
-        consumer_tasks.append(asyncio.create_task(consumer.process_messages()))
+        consumer_tasks.append(asyncio.create_task(consumer.run_loop()))
         logger.info("Consumer started")
+
+        acker = Acker(
+            ack_queue=ack_queue,
+            subscriber_client=subscriber,
+            subscription=SUBSCRIPTION,
+            name="1",
+        )
+        ack_tasks.append(asyncio.create_task(acker.run_loop()))
+        logger.info("Acker started")
 
         all_tasks = [*puller_tasks, *consumer_tasks]
         done, _ = await asyncio.wait(
