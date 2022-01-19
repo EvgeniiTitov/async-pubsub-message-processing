@@ -7,3 +7,13 @@
 
 TODO:
 1) kill -9 PID doesnt trigger the signal handler
+
+- Implement actual message processing callback
+    - Calling some API? Decide what you want
+- Complete Nacker
+- Complete Publisher
+- Refactor consume() which spins up and manages all the workers
+    - Move to app
+    - Move general functions to utils.py
+- Create user facing run.py script with argparse
+- Write a bit of tests kek

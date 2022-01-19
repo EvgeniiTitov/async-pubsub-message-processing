@@ -2,6 +2,7 @@ import asyncio
 import argparse
 import logging
 import typing as t
+import os
 
 from gcloud.aio.pubsub import PubsubMessage, PublisherClient
 import aiohttp
@@ -38,8 +39,8 @@ async def publish_messages(batch_size: int) -> None:
         logger.info("aiohttp.ClientSession created")
         client = PublisherClient(session=session)
         topic = client.topic_path(
-            project="gcp-wow-rwds-ai-mlchapter-dev",
-            topic="etitov-poc-sample-topic",
+            project=os.environ.get("PROJECT"),
+            topic=os.environ.get("TOPIC"),
         )
         logger.info("PubSub client initialized")
         message_generator = generate_messages_batch(batch_size)

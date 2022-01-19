@@ -8,13 +8,7 @@ from app.utils import LoggerMixin, accumulate_batch, get_remaining_messages
 from app._types import MessageHandlerCallable
 
 
-__all__ = (
-    "Puller",
-    "Consumer",
-    "Acker",
-    "Nacker",
-    "Publisher"
-)
+__all__ = ("Puller", "Consumer", "Acker", "Nacker", "Publisher")
 
 
 class BaseWorker(ABC):
@@ -219,7 +213,7 @@ class Acker(LoggerMixin, BaseWorker):
                     )
                 except Exception as e:
                     self._logger.error(
-                        f"Acknowledge request failed", exc_info=e
+                        "Acknowledge request failed", exc_info=e
                     )
                     # TODO: Try acking each ID separately?
                 except asyncio.CancelledError:

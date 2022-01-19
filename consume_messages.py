@@ -2,6 +2,7 @@ import asyncio
 import logging
 import typing as t
 import signal
+import os
 
 from gcloud.aio.pubsub import SubscriberClient, SubscriberMessage
 import aiohttp
@@ -15,7 +16,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="'%(levelname)s - %(filename)s:%(lineno)d -- %(message)s'",
 )
-SUBSCRIPTION = "projects/gcp-wow-rwds-ai-mlchapter-dev/subscriptions/etitov-poc-sample-topic-sub"
+SUBSCRIPTION = os.environ.get("SUBSCRIPTION")
 
 
 async def handle_message(message: SubscriberMessage) -> None:
