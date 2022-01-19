@@ -50,7 +50,6 @@ class Puller(LoggerMixin, BaseWorker):
         self._name = name
         self._running = False
         self._must_stop = False
-        self._logger.info(f"Puller{self._name} initialized")
 
     @property
     def is_running(self) -> bool:
@@ -114,7 +113,6 @@ class MessageProcessor(LoggerMixin, BaseWorker):
         self._sema = asyncio.Semaphore(max_concurrent_tasks)
         self._running = False
         self._must_stop = False
-        self._logger.info("MessageProcessor initialized")
 
     @property
     def is_running(self) -> bool:
@@ -196,7 +194,6 @@ class Acker(LoggerMixin, BaseWorker):
         self._name = name
         self._running = False
         self._must_stop = False
-        self._logger.info(f"Acker{self._name} initialized")
 
     @property
     def is_running(self) -> bool:
@@ -204,6 +201,7 @@ class Acker(LoggerMixin, BaseWorker):
 
     async def run_loop(self) -> None:
         self._running = True
+        self._logger.info(f"Acker{self._name} started")
         try:
             while True:
                 ack_ids: t.List[str] = []
@@ -265,7 +263,6 @@ class Nacker(LoggerMixin, BaseWorker):
         self._name = name
         self._running = False
         self._must_stop = False
-        self._logger.info(f"Nacker{self._name} initialized")
 
     @property
     def is_running(self) -> bool:
@@ -273,6 +270,7 @@ class Nacker(LoggerMixin, BaseWorker):
 
     async def run_loop(self) -> None:
         self._running = True
+        self._logger.info(f"Nacker{self._name} started")
         try:
             while True:
                 nacks_id: t.List[str] = []
