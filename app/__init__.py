@@ -10,6 +10,7 @@ import aiohttp
 from app._types import SignalHandlerCallable
 from app.workers import Puller, MessageProcessor, Acker, Nacker
 from app.utils import configure_event_loop
+from app.message_handler import handle_message
 
 
 logger = logging.getLogger(__file__)
@@ -17,15 +18,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="'%(levelname)s - %(filename)s:%(lineno)d -- %(message)s'",
 )
-
-
-async def handle_message(message: SubscriberMessage) -> None:
-    logger.info(f"Handling message: {message.data}")
-    """
-    Here things could be done asynchronously - i want to call some api/
-    do something to the message before publishing it to another pubsub topic
-    """
-    await asyncio.sleep(1)
 
 
 async def consume(
