@@ -1,40 +1,26 @@
+from abc import ABC, abstractmethod
 import asyncio
 import typing as t
-from abc import ABC, abstractmethod
-import time
 
-from gcloud.aio.pubsub import SubscriberClient, SubscriberMessage
+from gcloud.aio.pubsub import SubscriberMessage, SubscriberClient
 
-from _types import MessageHandlerCallable
-from logger import LoggerMixin
+from app.utils import LoggerMixin, accumulate_batch, get_remaining_messages
+from app._types import MessageHandlerCallable
 
 
-__all__ = ("Puller", "Consumer", "Acker", "Nacker", "Publisher")
-
-
-T = t.TypeVar("T")
+__all__ = (
+    "Puller",
+    "Consumer",
+    "Acker",
+    "Nacker",
+    "Publisher"
+)
 
 
 class BaseWorker(ABC):
     @abstractmethod
     async def run_loop(self, *args, **kwargs) -> None:
         ...
-
-
-async def _accumulate_batch(
-    queue: asyncio.Queue[T], time_window: float
-) -> t.List[T]:
-    batch = []
-    while time_window > 0:
-        start = time.perf_counter()
-        try:
-            message = await asyncio.wait_for(queue.get(), timeout=time_window)
-        except asyncio.TimeoutError:
-            break
-        else:
-            batch.append(message)
-            time_window -= time.perf_counter() - start
-    return batch
 
 
 class Puller(LoggerMixin, BaseWorker):
@@ -224,7 +210,7 @@ class Acker(LoggerMixin, BaseWorker):
                 # Ensure there's at least one ID to acknowledge + get any
                 # extra IDs within time window
                 ack_ids.append(await self._ack_queue.get())
-                ack_ids += await _accumulate_batch(
+                ack_ids += await accumulate_batch(
                     self._ack_queue, time_window=self._time_window
                 )
                 try:
@@ -245,7 +231,13 @@ class Acker(LoggerMixin, BaseWorker):
                         f"Acker{self._name} acknowledged a batch of IDs"
                     )
         except asyncio.CancelledError:
-            self._logger.info(f"Acker{self._name} worker cancelled")
+            self._logger.info(
+                f"Acker{self._name} cancelled. Gracefully terminating..."
+            )
+            pending_ids = await get_remaining_messages(self._ack_queue)
+            for _ in pending_ids:
+                self._ack_queue.task_done()
+            self._logger.info(f"Acker{self._name} terminated gracefully")
             raise
 
 

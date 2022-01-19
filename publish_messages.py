@@ -53,7 +53,7 @@ async def publish_messages(batch_size: int) -> None:
             asyncio.create_task(client.publish(topic, batch))
 
             logger.info("Published a batch of messages")
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.25)
 
 
 def main() -> int:

@@ -6,8 +6,8 @@ import signal
 from gcloud.aio.pubsub import SubscriberClient, SubscriberMessage
 import aiohttp
 
-from _types import SignalHandlerCallable
-from utils import Puller, Consumer, Acker
+from app._types import SignalHandlerCallable
+from app.workers import Puller, Consumer, Acker
 
 
 logger = logging.getLogger(__file__)
@@ -47,6 +47,7 @@ async def consume(pull_batch: int, num_pullers: int) -> None:
                 subscriber_client=subscriber,
                 message_queue=message_queue,
                 subscription=SUBSCRIPTION,
+                batch_size=pull_batch,
                 name=str(i),
             )
             puller_tasks.append(
@@ -73,7 +74,7 @@ async def consume(pull_batch: int, num_pullers: int) -> None:
         ack_tasks.append(asyncio.create_task(acker.run_loop()))
         logger.info("Acker started")
 
-        all_tasks = [*puller_tasks, *consumer_tasks]
+        all_tasks = [*puller_tasks, *consumer_tasks, *ack_tasks]
         done, _ = await asyncio.wait(
             all_tasks, return_when=asyncio.FIRST_COMPLETED
         )
@@ -131,7 +132,7 @@ def main() -> int:
     loop = asyncio.get_event_loop()
     configure_event_loop(loop)
     try:
-        loop.create_task(consume(batch_size, num_pullers=2))
+        loop.create_task(consume(pull_batch=batch_size, num_pullers=2))
         loop.run_forever()
     finally:
         loop.close()
