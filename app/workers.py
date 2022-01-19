@@ -4,11 +4,15 @@ import typing as t
 
 from gcloud.aio.pubsub import SubscriberMessage, SubscriberClient
 
-from app.utils import LoggerMixin, accumulate_batch, get_remaining_messages
+from app.utils import (
+    LoggerMixin,
+    accumulate_batch_within_timeout,
+    get_remaining_messages,
+)
 from app._types import MessageHandlerCallable
 
 
-__all__ = ("Puller", "Consumer", "Acker", "Nacker", "Publisher")
+__all__ = ("Puller", "MessageProcessor", "Acker", "Nacker", "Publisher")
 
 
 class BaseWorker(ABC):
@@ -20,7 +24,7 @@ class BaseWorker(ABC):
 class Puller(LoggerMixin, BaseWorker):
     """
     Pulls messages from a PubSub topic and puts them in a queue connected to
-    the Consumer
+    the MessageProcessor
 
     # TODO: Add message validation (json schema - pydantic?)
     # TODO: Gracefully terminate the puller if the coro gets cancelled. You
@@ -83,7 +87,7 @@ class Puller(LoggerMixin, BaseWorker):
         self._must_stop = True
 
 
-class Consumer(LoggerMixin, BaseWorker):
+class MessageProcessor(LoggerMixin, BaseWorker):
     """
     Receives messages to process from the message queue populated by the
     Puller(s).
@@ -110,7 +114,7 @@ class Consumer(LoggerMixin, BaseWorker):
         self._sema = asyncio.Semaphore(max_concurrent_tasks)
         self._running = False
         self._must_stop = False
-        self._logger.info("Consumer initialized")
+        self._logger.info("MessageProcessor initialized")
 
     @property
     def is_running(self) -> bool:
@@ -118,48 +122,50 @@ class Consumer(LoggerMixin, BaseWorker):
 
     async def run_loop(self) -> None:
         self._running = True
-        self._logger.info("Consumer started")
+        self._logger.info("MessageProcessor started")
         message_queue = self._message_queue
         try:
             while True:
                 message = await message_queue.get()
-                self._logger.info("Consumer received message")
+                self._logger.info("MessageProcessor received message")
                 await asyncio.shield(self._consume_one_message(message))
                 message_queue.task_done()
         except asyncio.CancelledError:
             self._logger.info(
-                "Consumer worker cancelled. Gracefully terminating"
+                "MessageProcessor cancelled. Gracefully terminating"
             )
             # Ensure all scheduled message processing jobs have completed
             for _ in range(self._max_concurrent_tasks):
                 await self._sema.acquire()
             self._logger.info(
-                "Consumer waited for all messages to get processed. "
+                "MessageProcessor waited for all messages to get processed. "
                 "Waiting for Acker and Nacker"
             )
             # Ensure Acker acknowledged all successfully processed messages
             await self._ack_queue.join()
+            self._logger.info("Acker queue joined")
             # Ensure Nacker naked all unsuccessfully processed messages
             await self._nack_queue.join()
-            self._logger.info("Consumer terminated gracefully")
+            self._logger.info("Nacker queue joined")
+            self._logger.info("MessageProcessor terminated gracefully")
             raise
 
     async def _consume_one_message(self, message: SubscriberMessage) -> None:
         await self._sema.acquire()
         task = asyncio.create_task(self._execute_callback(message))
         task.add_done_callback(lambda f: self._sema.release())
-        self._logger.info("Consumer scheduled message")
+        self._logger.info("MessageProcessor scheduled message")
 
     async def _execute_callback(self, message: SubscriberMessage) -> None:
         try:
             await self._callback(message)
             await self._ack_queue.put(message.ack_id)
         except asyncio.CancelledError:
-            # await self._nack_queue.put(message.ack_id)
+            await self._nack_queue.put(message.ack_id)
             self._logger.info("Callback was cancelled")
         except Exception as e:
-            # await self._nack_queue.put(message.ack_id)
-            self._logger.info(f"Provided callback raised exception {e}")
+            await self._nack_queue.put(message.ack_id)
+            self._logger.error(f"Provided callback raised exception {e}")
 
 
 class Publisher:
@@ -204,7 +210,7 @@ class Acker(LoggerMixin, BaseWorker):
                 # Ensure there's at least one ID to acknowledge + get any
                 # extra IDs within time window
                 ack_ids.append(await self._ack_queue.get())
-                ack_ids += await accumulate_batch(
+                ack_ids += await accumulate_batch_within_timeout(
                     self._ack_queue, time_window=self._time_window
                 )
                 try:
@@ -215,6 +221,7 @@ class Acker(LoggerMixin, BaseWorker):
                     self._logger.error(
                         "Acknowledge request failed", exc_info=e
                     )
+                    continue
                     # TODO: Try acking each ID separately?
                 except asyncio.CancelledError:
                     raise
@@ -228,6 +235,7 @@ class Acker(LoggerMixin, BaseWorker):
             self._logger.info(
                 f"Acker{self._name} cancelled. Gracefully terminating..."
             )
+            # TODO: This is not fucking graceful, you didn't ack remaining ids
             pending_ids = await get_remaining_messages(self._ack_queue)
             for _ in pending_ids:
                 self._ack_queue.task_done()
@@ -235,5 +243,68 @@ class Acker(LoggerMixin, BaseWorker):
             raise
 
 
-class Nacker:
-    pass
+class Nacker(LoggerMixin, BaseWorker):
+    """
+    Changes acknowledge deadline for messages whose processing has failed to 0,
+    so that they get redelivered
+    """
+
+    def __init__(
+        self,
+        nack_queue: asyncio.Queue,
+        subscriber_client: SubscriberClient,
+        subscription: str,
+        *,
+        batch_accumulation_time_window: float = 0.3,
+        name: t.Optional[str] = None,
+    ) -> None:
+        self._nack_queue = nack_queue
+        self._subscriber_client = subscriber_client
+        self._subscription = subscription
+        self._time_window = batch_accumulation_time_window
+        self._name = name
+        self._running = False
+        self._must_stop = False
+        self._logger.info(f"Nacker{self._name} initialized")
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    async def run_loop(self) -> None:
+        self._running = True
+        try:
+            while True:
+                nacks_id: t.List[str] = []
+                nacks_id.append(await self._nack_queue.get())
+                nacks_id += await accumulate_batch_within_timeout(
+                    self._nack_queue, time_window=self._time_window
+                )
+                try:
+                    await self._subscriber_client.modify_ack_deadline(
+                        subscription=self._subscription,
+                        ack_ids=nacks_id,
+                        ack_deadline_seconds=0,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._logger.error("Nack request failed", exc_info=e)
+                    # TODO: Try nacking one by one?
+                    continue
+                else:
+                    for _ in nacks_id:
+                        self._nack_queue.task_done()
+                    self._logger.info(
+                        f"Nacker{self._name} nacked a batch of IDs"
+                    )
+        except asyncio.CancelledError:
+            self._logger.info(
+                f"Nacker{self._name} cancelled. Gracefully terminating..."
+            )
+            # TODO: This is not fucking graceful, you didn't nack remaining ids
+            pending_ids = await get_remaining_messages(self._nack_queue)
+            for _ in pending_ids:
+                self._nack_queue.task_done()
+            self._logger.info(f"Nacker{self._name} terminated gracefully")
+            raise

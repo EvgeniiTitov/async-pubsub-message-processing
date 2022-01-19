@@ -8,7 +8,7 @@ from gcloud.aio.pubsub import SubscriberClient, SubscriberMessage
 import aiohttp
 
 from app._types import SignalHandlerCallable
-from app.workers import Puller, Consumer, Acker
+from app.workers import Puller, MessageProcessor, Acker, Nacker
 
 
 logger = logging.getLogger(__file__)
@@ -38,7 +38,7 @@ async def consume(pull_batch: int, num_pullers: int) -> None:
         nack_queue: "asyncio.Queue[SubscriberMessage]" = asyncio.Queue(100)
 
         puller_tasks: t.List[asyncio.Task] = []
-        consumer_tasks: t.List[asyncio.Task] = []
+        msg_processor_tasks: t.List[asyncio.Task] = []
         producer_tasks: t.List[asyncio.Task] = []
         ack_tasks: t.List[asyncio.Task] = []
         nack_tasks: t.List[asyncio.Task] = []
@@ -56,15 +56,17 @@ async def consume(pull_batch: int, num_pullers: int) -> None:
             )
         logger.info("Pullers started")
 
-        consumer = Consumer(
+        message_processor = MessageProcessor(
             message_queue=message_queue,
             ack_queue=ack_queue,
             nack_queue=nack_queue,
             handle_message_callback=handle_message,
             max_concurrent_tasks=100,
         )
-        consumer_tasks.append(asyncio.create_task(consumer.run_loop()))
-        logger.info("Consumer started")
+        msg_processor_tasks.append(
+            asyncio.create_task(message_processor.run_loop())
+        )
+        logger.info("Message Processor started")
 
         acker = Acker(
             ack_queue=ack_queue,
@@ -75,7 +77,22 @@ async def consume(pull_batch: int, num_pullers: int) -> None:
         ack_tasks.append(asyncio.create_task(acker.run_loop()))
         logger.info("Acker started")
 
-        all_tasks = [*puller_tasks, *consumer_tasks, *ack_tasks]
+        nacker = Nacker(
+            nack_queue=nack_queue,
+            subscriber_client=subscriber,
+            subscription=SUBSCRIPTION,
+            name="1",
+        )
+        nack_tasks.append(asyncio.create_task(nacker.run_loop()))
+        logger.info("Nacker started")
+
+        all_tasks = [
+            *puller_tasks,
+            *msg_processor_tasks,
+            *producer_tasks,
+            *ack_tasks,
+            *nack_tasks,
+        ]
         done, _ = await asyncio.wait(
             all_tasks, return_when=asyncio.FIRST_COMPLETED
         )

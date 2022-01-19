@@ -5,7 +5,11 @@ import logging
 import sys
 
 
-__all__ = ("LoggerMixin", "accumulate_batch", "get_remaining_messages")
+__all__ = (
+    "LoggerMixin",
+    "accumulate_batch_within_timeout",
+    "get_remaining_messages",
+)
 
 
 T = t.TypeVar("T")
@@ -26,7 +30,7 @@ class LoggerMixin:
         return logging.getLogger(name)
 
 
-async def accumulate_batch(
+async def accumulate_batch_within_timeout(
     queue: asyncio.Queue[T], time_window: float
 ) -> t.List[T]:
     batch = []
