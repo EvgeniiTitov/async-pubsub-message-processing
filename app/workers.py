@@ -1,15 +1,26 @@
 from abc import ABC, abstractmethod
 import asyncio
 import typing as t
+import json
 
-from gcloud.aio.pubsub import SubscriberMessage, SubscriberClient
+from pydantic import ValidationError as PydanticValidationError
+from gcloud.aio.pubsub import (
+    SubscriberMessage,
+    SubscriberClient,
+    PublisherClient,
+    PubsubMessage,
+)
 
 from app.utils import (
     LoggerMixin,
-    accumulate_batch_within_timeout,
-    get_remaining_messages,
+    mark_remaining_items_as_done,
+    get_items_batch,
 )
-from app._types import MessageHandlerCallable
+from app._types import (
+    MessageHandlerCallable,
+    MessagePayload,
+    MessageValidatorCallable,
+)
 
 
 __all__ = ("Puller", "MessageProcessor", "Acker", "Nacker", "Publisher")
@@ -20,16 +31,16 @@ class BaseWorker(ABC):
     async def run_loop(self, *args, **kwargs) -> None:
         ...
 
+    @property
+    @abstractmethod
+    def is_running(self) -> bool:
+        ...
+
 
 class Puller(LoggerMixin, BaseWorker):
     """
     Pulls messages from a PubSub topic and puts them in a queue connected to
     the MessageProcessor
-
-    # TODO: Add message validation (json schema - pydantic?)
-    # TODO: Gracefully terminate the puller if the coro gets cancelled. You
-            might have pulled messages that haven't been processed yet
-    # TODO: Do you really need self._must_stop? Its not a thread/process
     """
 
     def __init__(
@@ -49,7 +60,6 @@ class Puller(LoggerMixin, BaseWorker):
         self._timeout = timeout
         self._name = name
         self._running = False
-        self._must_stop = False
 
     @property
     def is_running(self) -> bool:
@@ -60,9 +70,6 @@ class Puller(LoggerMixin, BaseWorker):
         self._logger.info(f"Puller{self._name} started")
         try:
             while True:
-                if self._must_stop:
-                    break
-
                 messages = await self._subscriber_client.pull(
                     subscription=self._subscription,
                     max_messages=self._batch_size,
@@ -78,12 +85,10 @@ class Puller(LoggerMixin, BaseWorker):
                     else:
                         await self._queue.put(message)
         except asyncio.CancelledError:
+            # TODO: Do we ignore remaining unscheduled messages?
             self._logger.info(f"Puller{self._name} cancelled")
             raise
-        self._logger.info("Puller stopped")
-
-    def stop(self) -> None:
-        self._must_stop = True
+        self._logger.info("Puller terminated")
 
 
 class MessageProcessor(LoggerMixin, BaseWorker):
@@ -93,26 +98,28 @@ class MessageProcessor(LoggerMixin, BaseWorker):
     Processes messages by calling the callback provided on each message. If the
     message's been successfully processed, its ID lands in the ack queue to get
     acked.
-    # TODO: Do you really need self._must_stop?
     """
 
     def __init__(
         self,
+        *,
         message_queue: asyncio.Queue,
         ack_queue: asyncio.Queue,
         nack_queue: asyncio.Queue,
+        to_publisher_queue: asyncio.Queue,
         handle_message_callback: MessageHandlerCallable,
-        *,
+        validate_message_callback: MessageValidatorCallable,
         max_concurrent_tasks: int,
     ) -> None:
         self._message_queue = message_queue
         self._ack_queue = ack_queue
         self._nack_queue = nack_queue
-        self._callback = handle_message_callback
+        self._publisher_queue = to_publisher_queue
+        self._process_msg_callback = handle_message_callback
+        self._validate_msg_callback = validate_message_callback
         self._max_concurrent_tasks = max_concurrent_tasks
         self._sema = asyncio.Semaphore(max_concurrent_tasks)
         self._running = False
-        self._must_stop = False
 
     @property
     def is_running(self) -> bool:
@@ -130,51 +137,163 @@ class MessageProcessor(LoggerMixin, BaseWorker):
                 message_queue.task_done()
         except asyncio.CancelledError:
             self._logger.info(
-                "MessageProcessor cancelled. Gracefully terminating"
+                "MessageProcessor cancelled. Gracefully terminating..."
             )
-            # Ensure all scheduled message processing jobs have completed
-            for _ in range(self._max_concurrent_tasks):
-                await self._sema.acquire()
-            self._logger.info(
-                "MessageProcessor waited for all messages to get processed. "
-                "Waiting for Acker and Nacker"
-            )
-            # Ensure Acker acknowledged all successfully processed messages
-            await self._ack_queue.join()
-            self._logger.info("Acker queue joined")
-            # Ensure Nacker naked all unsuccessfully processed messages
-            await self._nack_queue.join()
-            self._logger.info("Nacker queue joined")
-            self._logger.info("MessageProcessor terminated gracefully")
+            await self._terminate_gracefully()
             raise
 
     async def _consume_one_message(self, message: SubscriberMessage) -> None:
+        message_content, message_id = message.data, message.ack_id
+        valid_message = await self._execute_message_validation_callback(
+            message_content
+        )
+        # TODO: IMPORTANT: That shit will get redelivered choking everything
+        if not valid_message:
+            await self._nack_queue.put(message_id)
+            return
         await self._sema.acquire()
-        task = asyncio.create_task(self._execute_callback(message))
+        task = asyncio.create_task(
+            self._execute_message_processing_callback(
+                valid_message, message_id
+            )
+        )
         task.add_done_callback(lambda f: self._sema.release())
         self._logger.info("MessageProcessor scheduled message")
 
-    async def _execute_callback(self, message: SubscriberMessage) -> None:
+    async def _execute_message_validation_callback(
+        self, message: t.Union[bytes, str]
+    ) -> t.Optional[MessagePayload]:
+        # TODO: IMPORTANT: Is it CPU intensive to validate large and
+        #       complicated schema? Should I run it in a threadpool?
         try:
-            await self._callback(message)
-            await self._ack_queue.put(message.ack_id)
-        except asyncio.CancelledError:
-            await self._nack_queue.put(message.ack_id)
-            self._logger.info("Callback was cancelled")
+            valid_message = self._validate_msg_callback(message)
+        except json.decoder.JSONDecodeError as e:
+            self._logger.warning(
+                f"Message {message} couldn't be decoded to json. Error: {e}"
+            )
+            return None
+        except PydanticValidationError:
+            self._logger.warning(
+                f"Message {message} is of incorrect schema, ignored"
+            )
+            return None
         except Exception as e:
-            await self._nack_queue.put(message.ack_id)
-            self._logger.error(f"Provided callback raised exception {e}")
+            self._logger.error(
+                f"Provided message validation callback raised exception: {e}"
+            )
+            # TODO: Can't continue, raise?
+        else:
+            return valid_message
+
+    async def _execute_message_processing_callback(
+        self, message: MessagePayload, message_id: str
+    ) -> None:
+        try:
+            result = await self._process_msg_callback(message)  # type: ignore
+        except asyncio.CancelledError:
+            self._logger.info("Callback was cancelled")
+            await self._nack_queue.put(message_id)
+        except Exception as e:
+            self._logger.error(
+                f"Provided message processing callback raised exception {e}"
+            )
+            await self._nack_queue.put(message_id)
+            # TODO: Cant continue, raise?
+        else:
+            await asyncio.gather(
+                self._ack_queue.put(message_id),
+                self._publisher_queue.put(result),
+            )
+
+    async def _terminate_gracefully(self) -> None:
+        # Ensure all scheduled message processing jobs have completed
+        # aka they all have released the sema
+        for _ in range(self._max_concurrent_tasks):
+            await self._sema.acquire()
+        self._logger.info(
+            "MessageProcessor waited for all messages to get processed. "
+            "Waiting for Acker and Nacker to complete..."
+        )
+        # Ensure Acker acknowledged all successfully processed messages
+        await self._ack_queue.join()
+        self._logger.info("Acker queue joined")
+        # Ensure Nacker naked all unsuccessfully processed messages
+        await self._nack_queue.join()
+        self._logger.info("Nacker queue joined")
+        self._logger.info("MessageProcessor terminated gracefully")
 
 
-class Publisher:
-    pass
+class Publisher(LoggerMixin, BaseWorker):
+    """
+    Receives messages to publish to a pubsub topic
+    """
+
+    def __init__(
+        self,
+        publisher_client: PublisherClient,
+        publisher_queue: asyncio.Queue,
+        *,
+        project: str,
+        topic: str,
+        publish_batch_size: int,
+        batch_accumulation_time_window: float = 0.3,
+        name: t.Optional[str] = None,
+    ) -> None:
+        self._publisher_client = publisher_client
+        self._publisher_queue = publisher_queue
+        self._publish_batch_size = publish_batch_size
+        self._time_window = batch_accumulation_time_window
+        self._topic = self._publisher_client.topic_path(
+            project=project, topic=topic
+        )
+        self._name = name
+        self._running = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    async def run_loop(self) -> None:
+        self._running = True
+        self._logger.info(f"Publisher{self._name} started")
+        try:
+            while True:
+                messages = await get_items_batch(
+                    queue=self._publisher_queue,
+                    time_window=self._time_window,
+                    max_items=self._publish_batch_size,
+                )
+                pubsub_messages = [
+                    PubsubMessage(str(message)) for message in messages
+                ]
+                try:
+                    await self._publisher_client.publish(
+                        topic=self._topic, messages=pubsub_messages
+                    )
+                except Exception as e:
+                    self._logger.error("Publish request failed", exc_info=e)
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                else:
+                    for _ in messages:
+                        self._publisher_queue.task_done()
+                    self._logger.info(
+                        f"Pubslisher{self._name} published a batch of messages"
+                    )
+        except asyncio.CancelledError:
+            self._logger.info(
+                f"Publisher{self._name} cancelled. Gracefully terminating..."
+            )
+            await mark_remaining_items_as_done(self._publisher_queue)
+            self._logger.info(f"Publisher{self._name} terminated gracefully")
+            raise
 
 
 class Acker(LoggerMixin, BaseWorker):
     """
     Acknowledges successfully processed messages by accumulating a batch of IDs
     and then calling Google's API
-    # TODO: Do you really need self._must_stop?
     # TODO: The logic is ugly, think again! Try re-acking if failed
     """
 
@@ -193,7 +312,6 @@ class Acker(LoggerMixin, BaseWorker):
         self._time_window = batch_accumulation_time_window
         self._name = name
         self._running = False
-        self._must_stop = False
 
     @property
     def is_running(self) -> bool:
@@ -204,12 +322,8 @@ class Acker(LoggerMixin, BaseWorker):
         self._logger.info(f"Acker{self._name} started")
         try:
             while True:
-                ack_ids: t.List[str] = []
-                # Ensure there's at least one ID to acknowledge + get any
-                # extra IDs within time window
-                ack_ids.append(await self._ack_queue.get())
-                ack_ids += await accumulate_batch_within_timeout(
-                    self._ack_queue, time_window=self._time_window
+                ack_ids = await get_items_batch(
+                    queue=self._ack_queue, time_window=self._time_window
                 )
                 try:
                     await self._subscriber_client.acknowledge(
@@ -234,9 +348,7 @@ class Acker(LoggerMixin, BaseWorker):
                 f"Acker{self._name} cancelled. Gracefully terminating..."
             )
             # TODO: This is not fucking graceful, you didn't ack remaining ids
-            pending_ids = await get_remaining_messages(self._ack_queue)
-            for _ in pending_ids:
-                self._ack_queue.task_done()
+            await mark_remaining_items_as_done(self._ack_queue)
             self._logger.info(f"Acker{self._name} terminated gracefully")
             raise
 
@@ -262,7 +374,6 @@ class Nacker(LoggerMixin, BaseWorker):
         self._time_window = batch_accumulation_time_window
         self._name = name
         self._running = False
-        self._must_stop = False
 
     @property
     def is_running(self) -> bool:
@@ -273,10 +384,8 @@ class Nacker(LoggerMixin, BaseWorker):
         self._logger.info(f"Nacker{self._name} started")
         try:
             while True:
-                nacks_id: t.List[str] = []
-                nacks_id.append(await self._nack_queue.get())
-                nacks_id += await accumulate_batch_within_timeout(
-                    self._nack_queue, time_window=self._time_window
+                nacks_id = await get_items_batch(
+                    queue=self._nack_queue, time_window=self._time_window
                 )
                 try:
                     await self._subscriber_client.modify_ack_deadline(
@@ -301,8 +410,6 @@ class Nacker(LoggerMixin, BaseWorker):
                 f"Nacker{self._name} cancelled. Gracefully terminating..."
             )
             # TODO: This is not fucking graceful, you didn't nack remaining ids
-            pending_ids = await get_remaining_messages(self._nack_queue)
-            for _ in pending_ids:
-                self._nack_queue.task_done()
+            await mark_remaining_items_as_done(self._nack_queue)
             self._logger.info(f"Nacker{self._name} terminated gracefully")
             raise

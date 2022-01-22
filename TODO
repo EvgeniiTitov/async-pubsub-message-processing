@@ -1,17 +1,12 @@
-1. Get pubsub message with some text (say a comment)
-
-2. Run semantic analysis
-
-3. Publish results to a different pubsub topic
+1. Get pubsub message (JSON)
+2. Validate the message
+3. Call a bunch of APIs to process the message (fake io task)
+4. Publish results to a different pubsub topic
 
 
 TODO:
 1) kill -9 PID doesnt trigger the signal handler
 
-- Implement actual message processing callback
-    - Calling some API? Decide what you want
-- Complete Nacker
-    - DEBUG - hangs when killing the app
-- Complete Publisher
-- Create user facing run.py script with argparse
+- Debug Nacker, hangs the app when terminating
 - Write a bit of tests kek
+- A way to track how many messages are getting processed

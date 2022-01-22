@@ -15,6 +15,8 @@ __all__ = (
     "get_remaining_messages",
     "configure_event_loop",
     "parse_arguments",
+    "mark_remaining_items_as_done",
+    "get_items_batch",
 )
 
 
@@ -37,10 +39,14 @@ class LoggerMixin:
 
 
 async def accumulate_batch_within_timeout(
-    queue: asyncio.Queue[T], time_window: float
+    queue: asyncio.Queue[T],
+    time_window: float,
+    max_items: t.Optional[int] = None,
 ) -> t.List[T]:
-    batch = []
+    batch: t.List[T] = []
     while time_window > 0:
+        if max_items is not None and len(batch) >= max_items:
+            return batch
         start = time.perf_counter()
         try:
             message = await asyncio.wait_for(queue.get(), timeout=time_window)
@@ -62,8 +68,27 @@ async def get_remaining_messages(queue: asyncio.Queue[T]) -> t.List[T]:
         else:
             remaining_messages.append(message)
             # TODO: Do I need it? In case I have 1+ Ackers/Nackers?
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0)
     return remaining_messages
+
+
+async def mark_remaining_items_as_done(queue: asyncio.Queue[T]) -> None:
+    remaining_items = await get_remaining_messages(queue)
+    for _ in remaining_items:
+        queue.task_done()
+
+
+async def get_items_batch(
+    queue: asyncio.Queue[T],
+    time_window: float,
+    max_items: t.Optional[int] = None,
+) -> t.List[T]:
+    batch: t.List[T] = []
+    batch.append(await queue.get())
+    batch += await accumulate_batch_within_timeout(
+        queue=queue, time_window=time_window, max_items=max_items
+    )
+    return batch
 
 
 def _register_signals(
@@ -96,8 +121,11 @@ def configure_event_loop(
 def parse_arguments() -> t.MutableMapping[str, int]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pull_size", type=int, default=5)
+    parser.add_argument("--push_size", type=int, default=25)
     parser.add_argument("--num_pullers", type=int, default=2)
     parser.add_argument("--msg_q_size", type=int, default=100)
     parser.add_argument("--ack_q_size", type=int, default=100)
+    parser.add_argument("--to_pb_q_size", type=int, default=100)
     parser.add_argument("--nack_q_size", type=int, default=50)
+    parser.add_argument("--max_concur_tasks", type=int)
     return vars(parser.parse_args())
