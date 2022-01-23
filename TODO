@@ -8,5 +8,7 @@ TODO:
 1) kill -9 PID doesnt trigger the signal handler
 
 - Debug Nacker, hangs the app when terminating
-- Write a bit of tests kek
+- Logger is blocking, use aiologger? Seems abandoned though
+- Write a bit of tests
 - A way to track how many messages are getting processed
+- Complete message processing bit to generate meaningful output

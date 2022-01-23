@@ -21,6 +21,7 @@ from app._types import (
     MessagePayload,
     MessageValidatorCallable,
 )
+from app.exceptions import MessageProcessingError
 
 
 __all__ = ("Puller", "MessageProcessor", "Acker", "Nacker", "Publisher")
@@ -148,8 +149,10 @@ class MessageProcessor(LoggerMixin, BaseWorker):
             message_content
         )
         # TODO: IMPORTANT: That shit will get redelivered choking everything
+        #       HACK: Just acknowledge it 5head
         if not valid_message:
-            await self._nack_queue.put(message_id)
+            # await self._nack_queue.put(message_id)
+            await self._ack_queue.put(message_id)
             return
         await self._sema.acquire()
         task = asyncio.create_task(
@@ -178,10 +181,10 @@ class MessageProcessor(LoggerMixin, BaseWorker):
             )
             return None
         except Exception as e:
-            self._logger.error(
+            self._logger.critical(
                 f"Provided message validation callback raised exception: {e}"
             )
-            # TODO: Can't continue, raise?
+            raise
         else:
             return valid_message
 
@@ -193,12 +196,15 @@ class MessageProcessor(LoggerMixin, BaseWorker):
         except asyncio.CancelledError:
             self._logger.info("Callback was cancelled")
             await self._nack_queue.put(message_id)
+        except MessageProcessingError as e:
+            self._logger.error(f"Failed to process message. Error: {e}")
+            # TODO: HACK: Acking failed msgs to avoid having them redelivered
+            await self._ack_queue.put(message_id)
         except Exception as e:
-            self._logger.error(
-                f"Provided message processing callback raised exception {e}"
+            self._logger.critical(
+                f"Provided message processing callback raised exception: {e}"
             )
-            await self._nack_queue.put(message_id)
-            # TODO: Cant continue, raise?
+            raise
         else:
             await asyncio.gather(
                 self._ack_queue.put(message_id),

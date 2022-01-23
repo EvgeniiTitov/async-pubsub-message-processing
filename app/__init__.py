@@ -29,7 +29,6 @@ logging.basicConfig(
 )
 
 
-# TODO: Rewrite it as a class + asyncio.CancelledError catch
 async def _consume(
     subscription: str,
     publish_project: str,
@@ -43,88 +42,89 @@ async def _consume(
     to_publisher_queue_size: int,
     max_concurrent_tasks: int,
 ) -> None:
-    async with aiohttp.ClientSession() as session:
-        subscriber_client = SubscriberClient(session=session)
-        publisher_client = PublisherClient(session=session)
-        logger.info("Subscriber and Publisher clients initialized")
-        message_queue: "asyncio.Queue[SubscriberMessage]" = asyncio.Queue(
-            message_queue_size
-        )
-        ack_queue: "asyncio.Queue[str]" = asyncio.Queue(ack_queue_size)
-        nack_queue: "asyncio.Queue[str]" = asyncio.Queue(nack_queue_size)
-        publisher_queue: "asyncio.Queue[t.Any]" = asyncio.Queue(
-            to_publisher_queue_size
-        )
+    try:
         puller_tasks: t.List[asyncio.Task] = []
         msg_processor_tasks: t.List[asyncio.Task] = []
         publisher_tasks: t.List[asyncio.Task] = []
         ack_tasks: t.List[asyncio.Task] = []
         nack_tasks: t.List[asyncio.Task] = []
 
-        for i in range(num_pullers):
-            puller = Puller(
-                subscriber_client=subscriber_client,
+        async with aiohttp.ClientSession() as session:
+            subscriber_client = SubscriberClient(session=session)
+            publisher_client = PublisherClient(session=session)
+            logger.info("Subscriber and Publisher clients initialized")
+
+            message_queue: "asyncio.Queue[SubscriberMessage]" = asyncio.Queue(
+                message_queue_size
+            )
+            ack_queue: "asyncio.Queue[str]" = asyncio.Queue(ack_queue_size)
+            nack_queue: "asyncio.Queue[str]" = asyncio.Queue(nack_queue_size)
+            publisher_queue: "asyncio.Queue[t.Any]" = asyncio.Queue(
+                to_publisher_queue_size
+            )
+            for i in range(num_pullers):
+                puller = Puller(
+                    subscriber_client=subscriber_client,
+                    message_queue=message_queue,
+                    subscription=subscription,
+                    batch_size=pull_batch,
+                    name=str(i),
+                )
+                puller_tasks.append(
+                    asyncio.create_task(puller.run_loop(put_async=False))
+                )
+            message_processor = MessageProcessor(
                 message_queue=message_queue,
+                ack_queue=ack_queue,
+                nack_queue=nack_queue,
+                to_publisher_queue=publisher_queue,
+                # Mypy has problems with partial, very cool
+                handle_message_callback=functools.partial(
+                    handle_message, session=session
+                ),
+                validate_message_callback=validate_message,
+                max_concurrent_tasks=max_concurrent_tasks,
+            )
+            msg_processor_tasks.append(
+                asyncio.create_task(message_processor.run_loop())
+            )
+            publisher = Publisher(
+                publisher_client=publisher_client,
+                publisher_queue=publisher_queue,
+                project=publish_project,
+                topic=publish_topic,
+                publish_batch_size=publish_batch,
+                name="1",
+            )
+            publisher_tasks.append(asyncio.create_task(publisher.run_loop()))
+            acker = Acker(
+                ack_queue=ack_queue,
+                subscriber_client=subscriber_client,
                 subscription=subscription,
-                batch_size=pull_batch,
-                name=str(i),
+                name="1",
             )
-            puller_tasks.append(
-                asyncio.create_task(puller.run_loop(put_async=False))
+            ack_tasks.append(asyncio.create_task(acker.run_loop()))
+            nacker = Nacker(
+                nack_queue=nack_queue,
+                subscriber_client=subscriber_client,
+                subscription=subscription,
+                name="1",
             )
-        message_processor = MessageProcessor(
-            message_queue=message_queue,
-            ack_queue=ack_queue,
-            nack_queue=nack_queue,
-            to_publisher_queue=publisher_queue,
-            # Mypy has problems with partial, very cool
-            handle_message_callback=functools.partial(
-                handle_message, session=session
-            ),
-            validate_message_callback=validate_message,
-            max_concurrent_tasks=max_concurrent_tasks,
-        )
-        msg_processor_tasks.append(
-            asyncio.create_task(message_processor.run_loop())
-        )
+            nack_tasks.append(asyncio.create_task(nacker.run_loop()))
 
-        publisher = Publisher(
-            publisher_client=publisher_client,
-            publisher_queue=publisher_queue,
-            project=publish_project,
-            topic=publish_topic,
-            publish_batch_size=publish_batch,
-            name="1",
-        )
-        publisher_tasks.append(asyncio.create_task(publisher.run_loop()))
-
-        acker = Acker(
-            ack_queue=ack_queue,
-            subscriber_client=subscriber_client,
-            subscription=subscription,
-            name="1",
-        )
-        ack_tasks.append(asyncio.create_task(acker.run_loop()))
-
-        nacker = Nacker(
-            nack_queue=nack_queue,
-            subscriber_client=subscriber_client,
-            subscription=subscription,
-            name="1",
-        )
-        nack_tasks.append(asyncio.create_task(nacker.run_loop()))
-
-        logger.info("All workers scheduled")
-        all_tasks = [
-            *puller_tasks,
-            *msg_processor_tasks,
-            *publisher_tasks,
-            *ack_tasks,
-            *nack_tasks,
-        ]
-        done, _ = await asyncio.wait(
-            all_tasks, return_when=asyncio.FIRST_COMPLETED
-        )
+            all_tasks = [
+                *puller_tasks,
+                *msg_processor_tasks,
+                *publisher_tasks,
+                *ack_tasks,
+                *nack_tasks,
+            ]
+            done, _ = await asyncio.wait(
+                all_tasks, return_when=asyncio.ALL_COMPLETED
+            )
+    except Exception as e:
+        logger.error(f"Consume shut down. Error: {e}")
+        raise
 
 
 async def _perform_shutdown(
